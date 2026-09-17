@@ -147,14 +147,17 @@ final class TerminalTabBarAppKitTests: XCTestCase {
         let newButton = try XCTUnwrap(sidebar.subviews.compactMap { $0 as? NSButton }.first)
         newButton.performClick(nil)
         XCTAssertEqual(created, 1)
+        let titleRefresh = expectation(description: "Title KVO refreshes the sidebar")
+        sidebar.onTabsChanged = { titleRefresh.fulfill() }
         window.title = "Updated title 🔔"
-        drainEvents()
+        await fulfillment(of: [titleRefresh], timeout: 2)
+        sidebar.onTabsChanged = nil
         let updatedCell = try XCTUnwrap(sidebar.tableView(table, viewFor: table.tableColumns.first, row: 0) as? NSTableCellView)
         XCTAssertEqual(updatedCell.textField?.stringValue, "Updated title 🔔")
         sidebar.attach(to: nil)
         XCTAssertEqual(table.numberOfRows, 0)
         window.title = "Closed"
-        drainEvents()
+        await drainEvents()
         XCTAssertEqual(table.numberOfRows, 0)
         // A recycled close-button callback must no longer act on a detached tab.
         closed = nil
@@ -179,12 +182,17 @@ final class TerminalTabBarAppKitTests: XCTestCase {
         first.addTabbedWindow(second, ordered: .above)
         first.tabGroup?.selectedWindow = first
         sidebar.attach(to: first)
-        drainEvents()
+        await drainEvents()
         let table = try XCTUnwrap(descendant(NSTableView.self, in: sidebar))
         XCTAssertEqual(table.numberOfRows, 2)
         XCTAssertEqual(table.selectedRow, 0)
+        let removalRefresh = expectation(description: "Native tab removal refreshes the sidebar")
+        sidebar.onTabsChanged = {
+            if table.numberOfRows == 1 { removalRefresh.fulfill() }
+        }
         first.tabGroup?.removeWindow(second)
-        drainEvents()
+        await fulfillment(of: [removalRefresh], timeout: 2)
+        sidebar.onTabsChanged = nil
         XCTAssertEqual(table.numberOfRows, 1)
         XCTAssertEqual(table.selectedRow, 0)
         sidebar.attach(to: nil)
@@ -198,8 +206,12 @@ final class TerminalTabBarAppKitTests: XCTestCase {
         return window
     }
 
-    private func drainEvents() {
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.05))
+    private func drainEvents() async {
+        // A nested RunLoop inside a MainActor XCTest task cannot re-enter the
+        // main dispatch queue. Yield the task so coalesced UI work can execute.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
     }
 
     private func descendant<T: NSView>(_ type: T.Type, in root: NSView) -> T? {
