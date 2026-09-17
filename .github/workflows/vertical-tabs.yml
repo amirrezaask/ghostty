@@ -1,0 +1,23 @@
+name: Vertical tabs regression tests
+on:
+  push:
+    branches: ["feat/macos-vertical-tabs"]
+  pull_request:
+    paths:
+      - "macos/Sources/Features/Terminal/TerminalTab*.swift"
+      - "macos/Sources/Features/Terminal/TerminalViewContainer.swift"
+      - "macos/Sources/Helpers/Extensions/NSWindow+Extension.swift"
+      - "macos/Tests/TerminalTabBarTests.swift"
+      - "macos/Scripts/test-vertical-tabs.sh"
+      - ".github/workflows/vertical-tabs.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  appkit-regressions:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile sidebar and run native AppKit and geometry regressions
+        run: bash macos/Scripts/test-vertical-tabs.sh

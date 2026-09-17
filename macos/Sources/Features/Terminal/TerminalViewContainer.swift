@@ -5,6 +5,20 @@ import SwiftUI
 /// Modifying `NSThemeFrame` can sometimes be unpredictable.
 class TerminalViewContainer: NSView {
     private let terminalView: NSView
+    private var terminalLeftConstraint: NSLayoutConstraint!
+    private var terminalRightConstraint: NSLayoutConstraint!
+    private var tabSidebar: TerminalTabSidebar?
+    private var tabPreferenceObserver: NSObjectProtocol?
+    private var tabCloseObserver: NSObjectProtocol?
+    private var terminalIsClosing = false
+
+    /// Restore the previous visibility, rather than assuming every native
+    /// accessory was visible before vertical tabs were enabled.
+    private struct HiddenTabAccessory {
+        weak var controller: NSTitlebarAccessoryViewController?
+        let wasHidden: Bool
+    }
+    private var hiddenTabAccessories: [HiddenTabAccessory] = []
 
     /// Background color applied with glass effect
     private(set) var glassEffectView: NSView?
@@ -40,14 +54,17 @@ class TerminalViewContainer: NSView {
     var initialContentSize: NSSize?
 
     override var intrinsicContentSize: NSSize {
-        let hostingSize = terminalView.intrinsicContentSize
+        var hostingSize = terminalView.intrinsicContentSize
         // The hosting view returns a valid size once SwiftUI has laid out
         // with the correct idealWidth/idealHeight. Before that (when
         // @FocusedValue hasn't propagated), it returns a tiny default.
         // Fall back to initialContentSize in that case.
         if let initialContentSize,
            hostingSize.width < initialContentSize.width || hostingSize.height < initialContentSize.height {
-            return initialContentSize
+            hostingSize = initialContentSize
+        }
+        if supportedTabBarPosition.isVertical, hostingSize.width >= 0 {
+            hostingSize.width += TerminalTabBarPreferences.shared.width
         }
         return hostingSize
     }
@@ -55,23 +72,153 @@ class TerminalViewContainer: NSView {
     private func setup() {
         addSubview(terminalView)
         terminalView.translatesAutoresizingMaskIntoConstraints = false
+        terminalLeftConstraint = terminalView.leftAnchor.constraint(equalTo: leftAnchor)
+        terminalRightConstraint = terminalView.rightAnchor.constraint(equalTo: rightAnchor)
         NSLayoutConstraint.activate([
             terminalView.topAnchor.constraint(equalTo: topAnchor),
-            terminalView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            terminalLeftConstraint,
             terminalView.bottomAnchor.constraint(equalTo: bottomAnchor),
-            terminalView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            terminalRightConstraint,
         ])
+        tabPreferenceObserver = NotificationCenter.default.addObserver(
+            forName: TerminalTabBarPreferences.didChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.invalidateIntrinsicContentSize()
+            self?.needsLayout = true
+        }
+        tabCloseObserver = NotificationCenter.default.addObserver(
+            forName: TerminalWindow.terminalWillCloseNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let self, let closingWindow = notification.object as? NSWindow,
+                  closingWindow === self.window else { return }
+            self.terminalIsClosing = true
+            self.tabSidebar?.attach(to: nil)
+        }
+    }
+
+    deinit {
+        if let tabPreferenceObserver { NotificationCenter.default.removeObserver(tabPreferenceObserver) }
+        if let tabCloseObserver { NotificationCenter.default.removeObserver(tabCloseObserver) }
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if window !== newWindow {
+            tabSidebar?.attach(to: nil)
+            restoreNativeTabBar()
+        }
+        super.viewWillMove(toWindow: newWindow)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        TerminalTabBarPreferences.shared.installMenuIfNeeded()
+        updateTabBarPresentation()
         updateGlassEffectIfNeeded()
         updateGlassEffectTopInsetIfNeeded()
     }
 
     override func layout() {
+        updateTabBarPresentation()
         super.layout()
         updateGlassEffectTopInsetIfNeeded()
+    }
+
+    /// Do not access tabGroup on the default/top path: that lazily initializes
+    /// relatively expensive native tabbing machinery even for a single window.
+    private var supportedTabBarPosition: TerminalTabBarPosition {
+        let position = TerminalTabBarPreferences.shared.position
+        guard position.isVertical, !terminalIsClosing,
+              let window = window as? TerminalWindow,
+              window.styleMask.contains(.titled), window.tabbingMode != .disallowed else { return .top }
+        if let fullscreen = window.terminalController?.fullscreenStyle,
+           fullscreen.isFullscreen && !fullscreen.supportsTabs { return .top }
+        return position
+    }
+
+    private func updateTabBarPresentation() {
+        let position = supportedTabBarPosition
+        let width = position.isVertical ? TerminalTabBarGeometry.width(
+            preferred: TerminalTabBarPreferences.shared.width, available: bounds.width) : 0
+        // Fall back to native tabs in a very narrow window. Keep the preference
+        // so widening the window brings back the sidebar automatically.
+        guard position.isVertical, width >= TerminalTabBarGeometry.minimumWidth,
+              let window = window as? TerminalWindow else {
+            tabSidebar?.isHidden = true
+            tabSidebar?.attach(to: nil)
+            terminalLeftConstraint.constant = 0
+            terminalRightConstraint.constant = 0
+            restoreNativeTabBar()
+            return
+        }
+
+        let sidebar: TerminalTabSidebar
+        if let existing = tabSidebar {
+            sidebar = existing
+        } else {
+            sidebar = makeTabSidebar()
+            tabSidebar = sidebar
+            addSubview(sidebar)
+        }
+        sidebar.isHidden = false
+        sidebar.position = position
+        sidebar.frame = NSRect(
+            x: position == .left ? 0 : bounds.width - width,
+            y: 0, width: width, height: max(0, bounds.height - safeAreaInsets.top))
+        terminalLeftConstraint.constant = position == .left ? width : 0
+        terminalRightConstraint.constant = position == .right ? -width : 0
+        sidebar.attach(to: window)
+
+        hiddenTabAccessories.removeAll { $0.controller == nil }
+        for accessory in window.titlebarAccessoryViewControllers where window.isTabBar(accessory) {
+            if !hiddenTabAccessories.contains(where: { $0.controller === accessory }) {
+                hiddenTabAccessories.append(.init(controller: accessory, wasHidden: accessory.isHidden))
+            }
+            // Collapsing the accessory hides the native bar without dismantling
+            // the tab group, session restoration or keyboard navigation.
+            if !accessory.isHidden { accessory.isHidden = true }
+        }
+    }
+
+    private func restoreNativeTabBar() {
+        for item in hiddenTabAccessories {
+            item.controller?.isHidden = item.wasHidden
+        }
+        hiddenTabAccessories.removeAll()
+    }
+
+    private func makeTabSidebar() -> TerminalTabSidebar {
+        let sidebar = TerminalTabSidebar(frame: .zero)
+        sidebar.onSelect = { window in
+            guard let controller = window.windowController as? TerminalController,
+                  controller.showWindowSafely(nil), let surface = controller.focusedSurface else { return }
+            DispatchQueue.main.async { [weak surface] in
+                guard let surface, surface.window?.isKeyWindow == true else { return }
+                Ghostty.moveFocus(to: surface, from: nil)
+            }
+        }
+        sidebar.onClose = { window in
+            (window.windowController as? TerminalController)?.closeTab(nil)
+        }
+        sidebar.onRename = { window in
+            guard let controller = window.windowController as? TerminalController,
+                  controller.showWindowSafely(nil) else { return }
+            controller.promptTabTitle()
+        }
+        sidebar.onMove = { window, amount in
+            guard let controller = window.windowController as? TerminalController,
+                  controller.showWindowSafely(nil), let surface = controller.focusedSurface else { return }
+            // Reuse the existing action, including the Tahoe tabbing workaround.
+            controller.performAction("move_tab:\(amount)", on: surface)
+        }
+        sidebar.onNewTab = { [weak self] in
+            (self?.window?.windowController as? TerminalController)?.newWindowForTab(nil)
+        }
+        sidebar.onTabsChanged = { [weak self] in
+            (self?.window?.windowController as? TerminalController)?.relabelTabs()
+            self?.needsLayout = true
+        }
+        sidebar.onResize = { width in TerminalTabBarPreferences.shared.setWidth(width) }
+        return sidebar
     }
 
     func ghosttyConfigDidChange(_ config: Ghostty.Config, preferredBackgroundColor: NSColor?) {

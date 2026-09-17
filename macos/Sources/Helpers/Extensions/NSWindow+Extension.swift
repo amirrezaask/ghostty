@@ -100,7 +100,8 @@ extension NSWindow {
 
     /// Returns the visual tab index and matching tab button at the given screen point.
     func tabButtonHit(atScreenPoint screenPoint: NSPoint) -> (index: Int, tabButton: NSView)? {
-        guard let tabBarView, let tabBarWindow = tabBarView.window else { return nil }
+        guard let tabBarView, let tabBarWindow = tabBarView.window,
+              !tabBarView.isHiddenOrHasHiddenAncestor, !tabBarView.visibleRect.isEmpty else { return nil }
 
         // In fullscreen, AppKit can host the titlebar and tab bar in a separate
         // NSToolbarFullScreenWindow. Hit testing has to use that window's base
