@@ -33,6 +33,7 @@ final class TerminalTabSidebar: NSView, NSTableViewDataSource, NSTableViewDelega
     private var tabs: [Tab] = []
     private var refreshScheduled = false
     private var updatingSelection = false
+    private var selectedTabID: ObjectIdentifier?
     private var resizeStartWidth: CGFloat = 0
 
     private let table = TerminalTabTableView()
@@ -51,6 +52,8 @@ final class TerminalTabSidebar: NSView, NSTableViewDataSource, NSTableViewDelega
         table.rowHeight = 32
         table.intercellSpacing = NSSize(width: 0, height: 2)
         table.style = .sourceList
+        table.autoresizingMask = [.width]
+        table.backgroundColor = .clear
         table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
         table.allowsMultipleSelection = false
         table.allowsEmptySelection = false
@@ -109,6 +112,10 @@ final class TerminalTabSidebar: NSView, NSTableViewDataSource, NSTableViewDelega
         let contentX = position == .right ? handleWidth : 0
         let contentWidth = max(0, bounds.width - handleWidth)
         scrollView.frame = NSRect(x: contentX, y: 44, width: contentWidth, height: max(0, bounds.height - 44))
+        var tableFrame = table.frame
+        tableFrame.size.width = scrollView.contentSize.width
+        table.frame = tableFrame
+        table.sizeLastColumnToFit()
         newTabButton.frame = NSRect(x: contentX + 8, y: 8, width: max(0, contentWidth - 16), height: 28)
         resizeHandle.frame = NSRect(
             x: position == .right ? 0 : contentWidth, y: 0, width: handleWidth, height: bounds.height)
@@ -135,6 +142,7 @@ final class TerminalTabSidebar: NSView, NSTableViewDataSource, NSTableViewDelega
         notifications.removeAll()
         observedGroup = nil
         tabs.removeAll()
+        selectedTabID = nil
         host = window
         guard let window else {
             table.reloadData()
@@ -198,7 +206,11 @@ final class TerminalTabSidebar: NSView, NSTableViewDataSource, NSTableViewDelega
         table.reloadData()
         if let selected = windows.firstIndex(where: { $0 === (group?.selectedWindow ?? host) }) {
             table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
-            table.scrollRowToVisible(selected)
+            let selectedID = ObjectIdentifier(windows[selected])
+            // A shell updating its title must not pull the user away from the
+            // rows they scrolled to. Reveal only a newly selected native tab.
+            if selectedTabID != selectedID { table.scrollRowToVisible(selected) }
+            selectedTabID = selectedID
         }
         updatingSelection = false
         onTabsChanged?()
@@ -234,6 +246,13 @@ final class TerminalTabSidebar: NSView, NSTableViewDataSource, NSTableViewDelega
     func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
                    willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
         table.didBeginDrag = true
+    }
+
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                   endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        // A cancelled/rejected drag may have selected a row without changing the
+        // native tab. Restore its highlight even when no group event follows.
+        scheduleRefresh()
     }
 
     private func window(at row: Int) -> NSWindow? {
